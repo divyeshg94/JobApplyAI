@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "JobApplyAi Autofill",
+  "version": "0.1.0",
+  "description": "Autofills Greenhouse/Lever application forms from your JobApplyAi profile. Never auto-submits, never auto-attaches files.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://boards.greenhouse.io/*",
+    "https://job-boards.greenhouse.io/*",
+    "https://jobs.lever.co/*",
+    "https://localhost:7010/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://boards.greenhouse.io/*", "https://job-boards.greenhouse.io/*"],
+      "js": ["content/field-mapper.js", "content/greenhouse-autofill.js"]
+    },
+    {
+      "matches": ["https://jobs.lever.co/*"],
+      "js": ["content/field-mapper.js", "content/lever-autofill.js"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html"
+  }
+}

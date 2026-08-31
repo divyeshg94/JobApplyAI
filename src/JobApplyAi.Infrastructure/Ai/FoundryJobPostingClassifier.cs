@@ -60,7 +60,18 @@ public class FoundryJobPostingClassifier(IChatClient chatClient) : IJobPostingCl
             ct);
 
         var json = ChatJsonHelper.StripMarkdownFences(response.Text);
-        var results = JsonSerializer.Deserialize<ClassificationResponse>(json, JsonDefaults.Options)?.Classifications;
+        List<ClassificationResult>? results;
+        try
+        {
+            results = JsonSerializer.Deserialize<ClassificationResponse>(json, JsonDefaults.Options)?.Classifications;
+        }
+        catch (JsonException)
+        {
+            // A response that doesn't even parse into the expected shape (e.g. a bare array
+            // instead of the wrapped object) must fail open the same as a parseable-but-wrong
+            // one below — not throw and abort the whole batch.
+            results = null;
+        }
 
         if (results is null || results.Count != postings.Count)
         {
