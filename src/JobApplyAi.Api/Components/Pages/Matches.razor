@@ -1,0 +1,228 @@
+@page "/matches"
+@rendermode InteractiveServer
+@using JobApplyAi.Api.Services
+@using JobApplyAi.Domain
+@using JobApplyAi.Domain.Abstractions
+@using JobApplyAi.Domain.Seed
+@using JobApplyAi.Infrastructure.Data
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.Extensions.DependencyInjection
+@inject IDbContextFactory<AppDbContext> DbFactory
+@inject IBlobStorageService BlobStorage
+@inject IServiceScopeFactory ScopeFactory
+
+<PageTitle>Matches</PageTitle>
+
+<h1>Matches</h1>
+
+@if (_error is not null)
+{
+    <p style="color: red;">@_error</p>
+}
+
+<p>
+    Status:
+    <select @bind="_statusFilter" @bind:after="LoadAsync">
+        <option value="">All (except dismissed)</option>
+        <option value="@MatchStatus.PendingReview">Pending review</option>
+        <option value="@MatchStatus.Notified">Notified</option>
+        <option value="@MatchStatus.Dismissed">Dismissed</option>
+    </select>
+    <button @onclick="LoadAsync">Refresh</button>
+</p>
+
+@if (_rows is null)
+{
+    <p>Loading…</p>
+}
+else if (_rows.Count == 0)
+{
+    <p>No matches yet. Once your profile is active, the background job scores postings every few minutes.</p>
+}
+else
+{
+    <table border="1" cellpadding="6" cellspacing="0">
+        <thead>
+            <tr>
+                <th>Score</th>
+                <th>Title</th>
+                <th>Company</th>
+                <th>Status</th>
+                <th>Reasoning</th>
+                <th>Apply</th>
+                <th>Application</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var row in _rows)
+            {
+                <tr>
+                    <td>@row.LlmScore.ToString("0")</td>
+                    <td>@row.Title</td>
+                    <td>@row.CompanyName</td>
+                    <td>@row.Status</td>
+                    <td style="max-width: 500px;">@row.LlmReasoning</td>
+                    <td><a href="@row.ApplyUrl" target="_blank" rel="noopener">Apply page</a></td>
+                    <td>
+                        @if (row.ApplicationStatus is null)
+                        {
+                            <button @onclick="() => GenerateAsync(row.MatchId)" disabled="@_generating.Contains(row.MatchId)">
+                                @(_generating.Contains(row.MatchId) ? "Generating…" : "Generate documents")
+                            </button>
+                        }
+                        else if (row.ApplicationStatus == ApplicationStatus.Prepped)
+                        {
+                            <div>
+                                @if (_downloadLinks.TryGetValue(row.MatchId, out var links))
+                                {
+                                    <a href="@links.Resume" target="_blank" rel="noopener">Resume</a>
+                                    <span> | </span>
+                                    <a href="@links.CoverLetter" target="_blank" rel="noopener">Cover letter</a>
+                                }
+                                <br />
+                                <button @onclick="() => MarkAppliedAsync(row.MatchId)">Mark applied</button>
+                                <button @onclick="() => GenerateAsync(row.MatchId)" disabled="@_generating.Contains(row.MatchId)">Regenerate</button>
+                            </div>
+                        }
+                        else if (row.ApplicationStatus == ApplicationStatus.Applied)
+                        {
+                            <strong>Applied</strong>
+                            @if (_downloadLinks.TryGetValue(row.MatchId, out var links))
+                            {
+                                <br />
+                                <a href="@links.Resume" target="_blank" rel="noopener">Resume</a>
+                                <span> | </span>
+                                <a href="@links.CoverLetter" target="_blank" rel="noopener">Cover letter</a>
+                            }
+                        }
+                    </td>
+                    <td>
+                        @if (row.Status != MatchStatus.Dismissed)
+                        {
+                            <button @onclick="() => DismissAsync(row.MatchId)">Dismiss</button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private sealed record MatchRow(
+        Guid MatchId, double LlmScore, string LlmReasoning, MatchStatus Status,
+        string Title, string CompanyName, string ApplyUrl,
+        Guid? ApplicationId, ApplicationStatus? ApplicationStatus);
+
+    private List<MatchRow>? _rows;
+    private readonly Dictionary<Guid, (string Resume, string CoverLetter)> _downloadLinks = new();
+    private readonly HashSet<Guid> _generating = new();
+    private string _statusFilter = "";
+    private string? _error;
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var query = db.MatchResults.Where(m => m.UserId == SeedData.DefaultUserId);
+
+        if (Enum.TryParse<MatchStatus>(_statusFilter, out var status))
+        {
+            query = query.Where(m => m.Status == status);
+        }
+        else
+        {
+            query = query.Where(m => m.Status != MatchStatus.Dismissed);
+        }
+
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var joined =
+            from m in query
+            join j in db.JobPostings on m.JobPostingId equals j.Id
+            join a in db.Applications on m.Id equals a.MatchResultId into apps
+            from a in apps.DefaultIfEmpty()
+            where j.ApplicationDeadline == null || j.ApplicationDeadline >= today
+            orderby m.LlmScore descending
+            select new { Match = m, Posting = j, Application = a };
+
+        // Materialize first, THEN project into the named record — EF fuses a trailing
+        // Select-into-record with a preceding OrderBy and can't translate ordering by a property
+        // of a freshly-constructed record. Doing it client-side here sidesteps that entirely.
+        var results = await joined.ToListAsync();
+        _rows = results.Select(x => new MatchRow(
+            x.Match.Id, x.Match.LlmScore, x.Match.LlmReasoning ?? "", x.Match.Status,
+            x.Posting.Title, x.Posting.CompanyName, x.Posting.ApplyUrl,
+            x.Application?.Id, x.Application?.Status)).ToList();
+
+        _downloadLinks.Clear();
+        foreach (var row in _rows.Where(r => r.ApplicationId is not null
+            && r.ApplicationStatus is ApplicationStatus.Prepped or ApplicationStatus.Applied))
+        {
+            var resumeUrl = await BlobStorage.GetDownloadUrlAsync(
+                BlobContainers.Generated, ApplicationGenerationService.ResumeBlobPath(SeedData.DefaultUserId, row.ApplicationId!.Value),
+                TimeSpan.FromMinutes(30), CancellationToken.None);
+            var coverLetterUrl = await BlobStorage.GetDownloadUrlAsync(
+                BlobContainers.Generated, ApplicationGenerationService.CoverLetterBlobPath(SeedData.DefaultUserId, row.ApplicationId!.Value),
+                TimeSpan.FromMinutes(30), CancellationToken.None);
+            _downloadLinks[row.MatchId] = (resumeUrl.ToString(), coverLetterUrl.ToString());
+        }
+    }
+
+    private async Task DismissAsync(Guid matchId)
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var match = await db.MatchResults.FirstOrDefaultAsync(m => m.Id == matchId);
+        if (match is not null)
+        {
+            match.Status = MatchStatus.Dismissed;
+            await db.SaveChangesAsync();
+        }
+
+        await LoadAsync();
+    }
+
+    private async Task GenerateAsync(Guid matchId)
+    {
+        _error = null;
+        _generating.Add(matchId);
+        try
+        {
+            // Fresh scope per action, not a circuit-lifetime @inject — ApplicationGenerationService
+            // holds a scoped AppDbContext, and Blazor Server circuits are long-lived, so injecting
+            // it directly would reuse the same DbContext (and its accumulated tracked entities)
+            // across the whole session. Same reasoning as the IDbContextFactory pattern above.
+            using var scope = ScopeFactory.CreateScope();
+            var generationService = scope.ServiceProvider.GetRequiredService<ApplicationGenerationService>();
+            await generationService.GenerateAsync(matchId, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _generating.Remove(matchId);
+        }
+
+        await LoadAsync();
+    }
+
+    private async Task MarkAppliedAsync(Guid matchId)
+    {
+        _error = null;
+        try
+        {
+            using var scope = ScopeFactory.CreateScope();
+            var generationService = scope.ServiceProvider.GetRequiredService<ApplicationGenerationService>();
+            await generationService.MarkAppliedAsync(matchId, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+
+        await LoadAsync();
+    }
+}

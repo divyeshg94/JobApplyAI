@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/JobApplyAi.Api/JobApplyAi.Api.csproj" />
+    <Project Path="src/JobApplyAi.Domain/JobApplyAi.Domain.csproj" />
+    <Project Path="src/JobApplyAi.Infrastructure/JobApplyAi.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/JobApplyAi.Api.Tests/JobApplyAi.Api.Tests.csproj" />
+    <Project Path="tests/JobApplyAi.Domain.Tests/JobApplyAi.Domain.Tests.csproj" />
+    <Project Path="tests/JobApplyAi.Infrastructure.Tests/JobApplyAi.Infrastructure.Tests.csproj" />
+  </Folder>
+</Solution>

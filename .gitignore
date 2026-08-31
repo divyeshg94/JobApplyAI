@@ -1,0 +1,31 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+artifacts/
+
+# secrets — never commit these
+.env
+.env.*
+appsettings.*.local.json
+appsettings.Development.json
+secrets.json
+*.pfx
+*.pem
+
+# Node / extension
+node_modules/
+extension/dist/
+extension/build/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp

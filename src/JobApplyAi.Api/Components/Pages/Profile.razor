@@ -1,0 +1,413 @@
+@page "/profile"
+@rendermode InteractiveServer
+@using System.Threading.Channels
+@using JobApplyAi.Api.BackgroundServices
+@using JobApplyAi.Domain
+@using JobApplyAi.Domain.Abstractions
+@using JobApplyAi.Domain.Entities
+@using JobApplyAi.Domain.Seed
+@using JobApplyAi.Infrastructure.Data
+@using Microsoft.EntityFrameworkCore
+@inject IDbContextFactory<AppDbContext> DbFactory
+@inject IBlobStorageService BlobStorage
+@inject Channel<ResumeParseJob> ParseQueue
+
+<PageTitle>Profile</PageTitle>
+
+<h1>Candidate profile</h1>
+
+@if (_error is not null)
+{
+    <p style="color: red;">@_error</p>
+}
+
+@if (_profile is null)
+{
+    <section>
+        <h2>Upload resume</h2>
+        <InputFile OnChange="OnFileSelected" accept=".pdf,.docx" />
+        @if (_uploading)
+        {
+            <p>Uploading & parsing… (@_pollStatus)</p>
+        }
+        @if (_hasNoProfileYet)
+        {
+            <p>No profile yet — upload a PDF or DOCX resume to start.</p>
+        }
+    </section>
+}
+else
+{
+    <section>
+        @if (_activated)
+        {
+            <p style="color: green; font-weight: bold;">
+                Activated — this profile now drives matching. New matches appear as the background job scores postings (runs every few minutes).
+            </p>
+        }
+        <p>
+            <strong>Status:</strong> @_profile.Status
+            @if (_profile.Status == ProfileStatus.NeedsReview)
+            {
+                <em> — review the parsed data below, edit anything wrong, then confirm.</em>
+            }
+        </p>
+
+        <h2>Contact</h2>
+        <p>
+            <label>Full name <input @bind="_profile.FullName" /></label><br />
+            <label>Email <input @bind="_profile.Email" /></label><br />
+            <label>Phone <input @bind="_profile.Phone" /></label><br />
+            <label>Location <input @bind="_profile.LocationText" /></label><br />
+            <label>LinkedIn <input @bind="_profile.LinkedInUrl" size="50" /></label><br />
+            <label>Portfolio <input @bind="_profile.PortfolioUrl" size="50" /></label>
+        </p>
+
+        <h2>Summary</h2>
+        <textarea @bind="_profile.SummaryText" rows="4" cols="80"></textarea>
+
+        <h2>Preferences <em style="font-weight: normal;">(hard filters — non-matching postings are excluded, not just scored lower)</em></h2>
+        <p>
+            <label>
+                <InputCheckbox @bind-Value="_profile.RequiresVisaSponsorship" />
+                Requires visa sponsorship
+            </label>
+        </p>
+        <p>
+            <label>Minimum salary (USD/year, blank = no floor) <InputNumber @bind-Value="_profile.MinimumSalaryUsd" /></label>
+        </p>
+        <p>
+            <label>Required work country (ISO code e.g. US, blank = no restriction) <input @bind="_profile.RequiredCountry" size="4" maxlength="10" /></label>
+        </p>
+        <p>
+            Excluded companies:
+            @foreach (var company in _profile.ExcludedCompanies)
+            {
+                <span style="display: inline-block; margin: 2px;">
+                    <input @bind="company.CompanyName" size="20" />
+                    <button @onclick="() => _profile.ExcludedCompanies.Remove(company)">×</button>
+                </span>
+            }
+            <button @onclick="AddExcludedCompany">Add company</button>
+        </p>
+
+        <h2>Work experience</h2>
+        @foreach (var work in _profile.WorkExperiences)
+        {
+            <fieldset>
+                <label>Company <input @bind="work.Company" /></label>
+                <label>Title <input @bind="work.Title" /></label><br />
+                <label>Start <InputDate @bind-Value="work.StartDate" /></label>
+                <label>End <InputDate @bind-Value="work.EndDate" /></label>
+                <label>Current <InputCheckbox @bind-Value="work.IsCurrent" /></label><br />
+                <textarea @bind="work.DescriptionText" rows="3" cols="80"></textarea><br />
+                <button @onclick="() => _profile.WorkExperiences.Remove(work)">Remove</button>
+            </fieldset>
+        }
+        <button @onclick="AddWork">Add experience</button>
+
+        <h2>Education</h2>
+        @foreach (var education in _profile.Educations)
+        {
+            <fieldset>
+                <label>Institution <input @bind="education.Institution" /></label>
+                <label>Degree <input @bind="education.Degree" /></label>
+                <label>Field <input @bind="education.FieldOfStudy" /></label>
+                <button @onclick="() => _profile.Educations.Remove(education)">Remove</button>
+            </fieldset>
+        }
+        <button @onclick="AddEducation">Add education</button>
+
+        <h2>Skills</h2>
+        @foreach (var skill in _profile.Skills)
+        {
+            <span style="display: inline-block; margin: 2px;">
+                <input @bind="skill.Name" size="15" />
+                <button @onclick="() => _profile.Skills.Remove(skill)">×</button>
+            </span>
+        }
+        <button @onclick="AddSkill">Add skill</button>
+
+        <hr />
+        <button @onclick="SaveAsync" disabled="@_busy">Save</button>
+        <button @onclick="ConfirmAsync" disabled="@_busy">Save &amp; activate</button>
+        <button @onclick="StartOver" disabled="@_busy">Upload different resume</button>
+        @if (_saved)
+        {
+            <span> Saved.</span>
+        }
+    </section>
+}
+
+@code {
+    private CandidateProfile? _profile;
+    private bool _uploading;
+    private bool _busy;
+    private bool _saved;
+    private bool _activated;
+    private bool _hasNoProfileYet;
+    private string _pollStatus = "";
+    private string? _error;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _profile = await db.CandidateProfiles
+            .Include(p => p.WorkExperiences)
+            .Include(p => p.Educations)
+            .Include(p => p.Skills)
+            .Include(p => p.ExcludedCompanies)
+            .Where(p => p.UserId == SeedData.DefaultUserId
+                && (p.Status == ProfileStatus.Active || p.Status == ProfileStatus.NeedsReview))
+            .OrderByDescending(p => p.CreatedAtUtc)
+            .FirstOrDefaultAsync();
+        _hasNoProfileYet = _profile is null;
+    }
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        _error = null;
+        _uploading = true;
+        try
+        {
+            var file = e.File;
+            using var memory = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(memory);
+            var bytes = memory.ToArray();
+
+            var profile = new CandidateProfile
+            {
+                Id = Guid.NewGuid(),
+                UserId = SeedData.DefaultUserId,
+                Status = ProfileStatus.Parsing,
+                RawResumeFileName = file.Name,
+                RawResumeContentType = file.ContentType,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+            };
+
+            memory.Position = 0;
+            profile.RawResumeBlobUrl = await BlobStorage.UploadAsync(
+                BlobContainers.Resumes,
+                $"raw/{profile.UserId}/{profile.Id}/{Path.GetFileName(file.Name)}",
+                memory,
+                file.ContentType,
+                CancellationToken.None);
+
+            await using (var db = await DbFactory.CreateDbContextAsync())
+            {
+                db.CandidateProfiles.Add(profile);
+                await db.SaveChangesAsync();
+            }
+
+            await ParseQueue.Writer.WriteAsync(new ResumeParseJob(profile.Id, bytes, file.Name, file.ContentType));
+            await PollUntilParsedAsync(profile.Id);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _uploading = false;
+        }
+    }
+
+    private async Task PollUntilParsedAsync(Guid profileId)
+    {
+        for (var i = 0; i < 120; i++)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2));
+            await using var db = await DbFactory.CreateDbContextAsync();
+            var current = await db.CandidateProfiles
+                .Include(p => p.WorkExperiences)
+                .Include(p => p.Educations)
+                .Include(p => p.Skills)
+                .FirstAsync(p => p.Id == profileId);
+            _pollStatus = current.Status.ToString();
+            StateHasChanged();
+
+            if (current.Status == ProfileStatus.NeedsReview)
+            {
+                _profile = current;
+                return;
+            }
+
+            if (current.Status == ProfileStatus.Failed)
+            {
+                _error = "Parsing failed — try again or a different file.";
+                return;
+            }
+        }
+
+        _error = "Parsing timed out.";
+    }
+
+    private void AddWork() => _profile!.WorkExperiences.Add(new ProfileWorkExperience
+    {
+        Id = Guid.NewGuid(),
+        CandidateProfileId = _profile.Id,
+        Company = "",
+        Title = "",
+    });
+
+    private void AddEducation() => _profile!.Educations.Add(new ProfileEducation
+    {
+        Id = Guid.NewGuid(),
+        CandidateProfileId = _profile.Id,
+        Institution = "",
+    });
+
+    private void AddSkill() => _profile!.Skills.Add(new ProfileSkill
+    {
+        Id = Guid.NewGuid(),
+        CandidateProfileId = _profile.Id,
+        Name = "",
+    });
+
+    private void AddExcludedCompany() => _profile!.ExcludedCompanies.Add(new ProfileExcludedCompany
+    {
+        Id = Guid.NewGuid(),
+        CandidateProfileId = _profile.Id,
+        CompanyName = "",
+    });
+
+    private async Task SaveAsync()
+    {
+        _busy = true;
+        _saved = false;
+        _error = null;
+        try
+        {
+            // _profile's object graph was loaded by an earlier, now-disposed DbContext.
+            // db.Update(_profile) on a fresh context would mark that whole foreign graph
+            // Modified by assumption — if any child's tracked shape has drifted, EF issues an
+            // UPDATE that matches 0 rows (DbUpdateConcurrencyException). Instead: load a
+            // same-context tracked entity and copy values across, same as the API endpoint.
+            await using var db = await DbFactory.CreateDbContextAsync();
+            var tracked = await db.CandidateProfiles
+                .Include(p => p.WorkExperiences)
+                .Include(p => p.Educations)
+                .Include(p => p.Skills)
+                .Include(p => p.ExcludedCompanies)
+                .FirstAsync(p => p.Id == _profile!.Id);
+
+            tracked.FullName = _profile!.FullName;
+            tracked.Email = _profile.Email;
+            tracked.Phone = _profile.Phone;
+            tracked.LocationText = _profile.LocationText;
+            tracked.LinkedInUrl = _profile.LinkedInUrl;
+            tracked.PortfolioUrl = _profile.PortfolioUrl;
+            tracked.SummaryText = _profile.SummaryText;
+            tracked.RequiresVisaSponsorship = _profile.RequiresVisaSponsorship;
+            tracked.MinimumSalaryUsd = _profile.MinimumSalaryUsd;
+            tracked.RequiredCountry = string.IsNullOrWhiteSpace(_profile.RequiredCountry)
+                ? null
+                : _profile.RequiredCountry.Trim().ToUpperInvariant();
+
+            // Explicit db.<Set>.AddRange() alongside the navigation Add() matters: new children
+            // have client-set Guid keys and, left to EF's own graph-fixup heuristic, can be
+            // inferred Modified instead of Added — producing an UPDATE that matches 0 rows
+            // (DbUpdateConcurrencyException) since the row never existed.
+            tracked.WorkExperiences.Clear();
+            var newWorkExperiences = _profile.WorkExperiences.Select(w => new ProfileWorkExperience
+            {
+                Id = Guid.NewGuid(),
+                CandidateProfileId = tracked.Id,
+                Company = w.Company,
+                Title = w.Title,
+                LocationText = w.LocationText,
+                StartDate = w.StartDate,
+                EndDate = w.EndDate,
+                IsCurrent = w.IsCurrent,
+                DescriptionText = w.DescriptionText,
+            }).ToList();
+            tracked.WorkExperiences.AddRange(newWorkExperiences);
+            db.ProfileWorkExperiences.AddRange(newWorkExperiences);
+
+            tracked.Educations.Clear();
+            var newEducations = _profile.Educations.Select(e => new ProfileEducation
+            {
+                Id = Guid.NewGuid(),
+                CandidateProfileId = tracked.Id,
+                Institution = e.Institution,
+                Degree = e.Degree,
+                FieldOfStudy = e.FieldOfStudy,
+                StartDate = e.StartDate,
+                EndDate = e.EndDate,
+            }).ToList();
+            tracked.Educations.AddRange(newEducations);
+            db.ProfileEducations.AddRange(newEducations);
+
+            tracked.Skills.Clear();
+            var newSkills = _profile.Skills.Select(s => new ProfileSkill
+            {
+                Id = Guid.NewGuid(),
+                CandidateProfileId = tracked.Id,
+                Name = s.Name,
+                Category = s.Category,
+            }).ToList();
+            tracked.Skills.AddRange(newSkills);
+            db.ProfileSkills.AddRange(newSkills);
+
+            tracked.ExcludedCompanies.Clear();
+            var newExcludedCompanies = _profile.ExcludedCompanies.Select(c => new ProfileExcludedCompany
+            {
+                Id = Guid.NewGuid(),
+                CandidateProfileId = tracked.Id,
+                CompanyName = c.CompanyName,
+            }).ToList();
+            tracked.ExcludedCompanies.AddRange(newExcludedCompanies);
+            db.ProfileExcludedCompanies.AddRange(newExcludedCompanies);
+
+            await db.SaveChangesAsync();
+            _profile = tracked;
+            _saved = true;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ConfirmAsync()
+    {
+        await SaveAsync();
+        if (_error is not null)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            // Embedding generation + activation lives in ProfileActivationService so the
+            // API endpoint and this UI share one code path.
+            await using var db = await DbFactory.CreateDbContextAsync();
+            await Services.ProfileActivationService.ActivateAsync(db, _profile!.Id, EmbeddingGenerator);
+            _profile.Status = ProfileStatus.Active;
+            _activated = true;
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void StartOver()
+    {
+        _profile = null;
+        _hasNoProfileYet = true;
+        _pollStatus = "";
+    }
+
+    [Inject]
+    private Microsoft.Extensions.AI.IEmbeddingGenerator<string, Microsoft.Extensions.AI.Embedding<float>> EmbeddingGenerator { get; set; } = default!;
+}
